@@ -149,17 +149,43 @@ func (f *Document) NumPage() int {
 	return int(C.fz_count_pages(f.ctx, f.doc))
 }
 
+// MaxImageSize returns the maximum image size in bytes at a given resolution.
+func (f *Document) MaxImageSize(dpi float64) int {
+	var maxSize int
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	npages := int(C.fz_count_pages(f.ctx, f.doc))
+	for pageNumber := 0; pageNumber < npages; pageNumber++ {
+		page := C.fz_load_page(f.ctx, f.doc, C.int(pageNumber))
+		defer C.fz_drop_page(f.ctx, page)
+
+		var bounds C.fz_rect
+		C.fz_bound_page(f.ctx, page, &bounds)
+
+		var ctm C.fz_matrix
+		C.fz_scale(&ctm, C.float(dpi/72), C.float(dpi/72))
+
+		var bbox C.fz_irect
+		C.fz_transform_rect(&bounds, &ctm)
+		C.fz_round_rect(&bbox, &bounds)
+		pageSize := int(4 * bbox.x1 * bbox.y1)
+		if maxSize < pageSize {
+			maxSize = pageSize
+		}
+	}
+
+	return maxSize
+}
+
 // Image returns image for given page number.
 func (f *Document) Image(pageNumber int) (image.Image, error) {
 	return f.ImageDPI(pageNumber, 300.0)
 }
 
-// ImageDPI returns image for given page number and DPI.
-func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
+func (f *Document) imagePixels(pageNumber int, dpi float64, bbox *C.fz_irect) (unsafe.Pointer, error) {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
-
-	img := image.RGBA{}
 
 	if pageNumber >= f.NumPage() {
 		return nil, ErrPageMissing
@@ -174,11 +200,10 @@ func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
 	var ctm C.fz_matrix
 	C.fz_scale(&ctm, C.float(dpi/72), C.float(dpi/72))
 
-	var bbox C.fz_irect
 	C.fz_transform_rect(&bounds, &ctm)
-	C.fz_round_rect(&bbox, &bounds)
+	C.fz_round_rect(bbox, &bounds)
 
-	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), &bbox, nil, 1)
+	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), bbox, nil, 1)
 	if pixmap == nil {
 		return nil, ErrCreatePixmap
 	}
@@ -198,6 +223,21 @@ func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
 	pixels := C.fz_pixmap_samples(f.ctx, pixmap)
 	if pixels == nil {
 		return nil, ErrPixmapSamples
+	}
+	return unsafe.Pointer(pixels), nil
+}
+
+// ImageDPI returns image for given page number and DPI.
+func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	img := image.RGBA{}
+
+	var bbox C.fz_irect
+	pixels, err := f.imagePixels(pageNumber, dpi, &bbox)
+	if err != nil {
+		return nil, err
 	}
 
 	img.Pix = C.GoBytes(unsafe.Pointer(pixels), C.int(4*bbox.x1*bbox.y1))
