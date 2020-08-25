@@ -228,7 +228,7 @@ func (f *Document) ImageReadDPI(pageNumber int, dpi float64, img *image.RGBA) er
 		return ErrPixmapSamples
 	}
 
-	if len(img.Pix) < int(4*bbox.x1*bbox.y1) {
+	if cap(img.Pix) < int(4*bbox.x1*bbox.y1) {
 		return ErrBufferSize
 	}
 	ptr := (*[1 << 20]byte)(unsafe.Pointer(pixels))[:]
