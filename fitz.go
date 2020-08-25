@@ -32,6 +32,7 @@ var (
 	ErrPixmapSamples = errors.New("fitz: cannot get pixmap samples")
 	ErrNeedsPassword = errors.New("fitz: document needs password")
 	ErrLoadOutline   = errors.New("fitz: cannot load outline")
+	ErrBufferSize    = errors.New("Invalid image buffer size")
 )
 
 // Document represents fitz document.
@@ -183,9 +184,66 @@ func (f *Document) Image(pageNumber int) (image.Image, error) {
 	return f.ImageDPI(pageNumber, 300.0)
 }
 
-func (f *Document) imagePixels(pageNumber int, dpi float64, bbox *C.fz_irect) (unsafe.Pointer, error) {
+// ImageReadDPI reads a PDF page into a preallocate image.
+func (f *Document) ImageReadDPI(pageNumber int, dpi float64, img *image.RGBA) error {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
+
+	if pageNumber >= f.NumPage() {
+		return ErrPageMissing
+	}
+
+	page := C.fz_load_page(f.ctx, f.doc, C.int(pageNumber))
+	defer C.fz_drop_page(f.ctx, page)
+
+	var bounds C.fz_rect
+	C.fz_bound_page(f.ctx, page, &bounds)
+
+	var ctm C.fz_matrix
+	C.fz_scale(&ctm, C.float(dpi/72), C.float(dpi/72))
+
+	var bbox C.fz_irect
+	C.fz_transform_rect(&bounds, &ctm)
+	C.fz_round_rect(&bbox, &bounds)
+
+	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), &bbox, nil, 1)
+	if pixmap == nil {
+		return ErrCreatePixmap
+	}
+
+	C.fz_clear_pixmap_with_value(f.ctx, pixmap, C.int(0xff))
+	defer C.fz_drop_pixmap(f.ctx, pixmap)
+
+	device := C.fz_new_draw_device(f.ctx, &ctm, pixmap)
+	C.fz_enable_device_hints(f.ctx, device, C.FZ_NO_CACHE)
+	defer C.fz_drop_device(f.ctx, device)
+
+	drawMatrix := C.fz_identity
+	C.fz_run_page(f.ctx, page, device, &drawMatrix, nil)
+
+	C.fz_close_device(f.ctx, device)
+
+	pixels := C.fz_pixmap_samples(f.ctx, pixmap)
+	if pixels == nil {
+		return ErrPixmapSamples
+	}
+
+	if len(img.Pix) < int(4*bbox.x1*bbox.y1) {
+		return ErrBufferSize
+	}
+	ptr := (*[1 << 20]byte)(unsafe.Pointer(pixels))[:]
+	copy(img.Pix, ptr)
+	img.Rect = image.Rect(int(bbox.x0), int(bbox.y0), int(bbox.x1), int(bbox.y1))
+	img.Stride = 4 * img.Rect.Max.X
+	return nil
+}
+
+// ImageDPI returns image for given page number and DPI.
+func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	img := image.RGBA{}
 
 	if pageNumber >= f.NumPage() {
 		return nil, ErrPageMissing
@@ -200,10 +258,11 @@ func (f *Document) imagePixels(pageNumber int, dpi float64, bbox *C.fz_irect) (u
 	var ctm C.fz_matrix
 	C.fz_scale(&ctm, C.float(dpi/72), C.float(dpi/72))
 
+	var bbox C.fz_irect
 	C.fz_transform_rect(&bounds, &ctm)
-	C.fz_round_rect(bbox, &bounds)
+	C.fz_round_rect(&bbox, &bounds)
 
-	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), bbox, nil, 1)
+	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), &bbox, nil, 1)
 	if pixmap == nil {
 		return nil, ErrCreatePixmap
 	}
@@ -223,21 +282,6 @@ func (f *Document) imagePixels(pageNumber int, dpi float64, bbox *C.fz_irect) (u
 	pixels := C.fz_pixmap_samples(f.ctx, pixmap)
 	if pixels == nil {
 		return nil, ErrPixmapSamples
-	}
-	return unsafe.Pointer(pixels), nil
-}
-
-// ImageDPI returns image for given page number and DPI.
-func (f *Document) ImageDPI(pageNumber int, dpi float64) (image.Image, error) {
-	f.mtx.Lock()
-	defer f.mtx.Unlock()
-
-	img := image.RGBA{}
-
-	var bbox C.fz_irect
-	pixels, err := f.imagePixels(pageNumber, dpi, &bbox)
-	if err != nil {
-		return nil, err
 	}
 
 	img.Pix = C.GoBytes(unsafe.Pointer(pixels), C.int(4*bbox.x1*bbox.y1))
